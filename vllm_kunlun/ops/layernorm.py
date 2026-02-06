@@ -30,13 +30,13 @@ def vllm_kunlun_forward_cuda(
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """forward_cuda"""
         if x.is_contiguous() == False:
-            # kunlun does not support uncontiguous input and they do not think it is a bug 
+            # kunlun does not support uncontiguous input and they do not think it is a bug
             # so we must make it contiguous() manually
             x = x.contiguous()
         if self.variance_size_override is not None:
             return self.forward_native(x, residual)
 
-        
+
         if residual is not None:
             # residual_output = torch.empty_like(residual)
             torch.ops._C.add_rmsnorm(
@@ -59,7 +59,7 @@ def vllm_kunlun_forward_cuda(
 
 RMSNorm.forward_cuda = vllm_kunlun_forward_cuda
 RMSNorm.forward = vllm_kunlun_forward_cuda
-
+import kunlun_ops
 class KunlunGemmaRMSNorm(OriGemmaRMSNorm):
     @staticmethod
     def forward_xpu(
@@ -72,26 +72,38 @@ class KunlunGemmaRMSNorm(OriGemmaRMSNorm):
             # kunlun does not support uncontiguous input and they do not think it is a bug
             # so we must make it contiguous() manually
             x = x.contiguous()
-
+        if x.dim() == 3:
+            x_shape = x.shape
+            x = x.view(-1, x.size(-1))
         if residual is not None:
-            torch.ops._C.add_rmsnorm(
+            out = torch.empty_like(x)
+            out_residual = torch.empty_like(residual)
+            torch.ops._C.gemma_add_rmsnorm(
                 x,
                 residual,
-                residual_output=residual,
-                weight=weight+1,
+                residual_output=out_residual,
+                weight=weight,
                 eps=variance_epsilon,
-                output=x
+                output=out
             )
-            return x, residual
+        else:
+            out = torch.empty_like(x)
+            torch.ops._C.gemma_rmsnorm(
+                x,
+                weight,
+                out,
+                variance_epsilon,
+            )
 
-        out = torch.empty_like(x)
-        torch.ops._C.rmsnorm(
-            x,
-            weight+1,
-            out,
-            variance_epsilon,
-        )
-        return out
+        if x.dim() == 3:
+            x = x.view(x_shape)
+            if out is not None:
+                out = out.view(x_shape)
+
+        if residual is not None:
+            return out, out_residual
+        else:
+            return out
 
     def forward_cuda(
         self,
