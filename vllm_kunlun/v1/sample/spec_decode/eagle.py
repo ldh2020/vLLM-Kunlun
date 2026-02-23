@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 logger = init_logger(__name__)
 
@@ -308,5 +309,5 @@ def prepare_next_token_ids_padded(self,
 
         return next_token_ids, valid_sampled_tokens_count
 
-EagleProposer.propose = propose
+# EagleProposer.propose = propose
 EagleProposer.prepare_next_token_ids_padded = prepare_next_token_ids_padded

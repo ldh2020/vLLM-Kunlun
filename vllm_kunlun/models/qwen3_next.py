@@ -58,7 +58,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
 from vllm.utils import direct_register_custom_op
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm_kunlun.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from vllm.model_executor.models.interfaces import (HasInnerState, IsHybrid, MixtureOfExperts,
                          SupportsLoRA, SupportsPP)
@@ -253,7 +253,7 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         return "linear_attention"
 
     def get_attn_backend(self) -> type["AttentionBackend"]:
-        from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
+        from vllm_kunlun.v1.attention.backends.gdn_attn import GDNAttentionBackend
         return GDNAttentionBackend
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
@@ -485,10 +485,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         non_spec_state_indices_tensor_cpu = attn_metadata.non_spec_state_indices_tensor_cpu
         self_kv_cache = self.kv_cache[forward_context.virtual_engine]
         conv_state = self_kv_cache[0]
-        # if attn_metadata.num_prefills > 0:
-        #     conv_state = self_kv_cache[0].transpose(-1, -2)
-        # else:
-        #     conv_state = self_kv_cache[0]
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
@@ -554,7 +550,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 metadata=attn_metadata,
             )
         elif attn_metadata.num_decodes > 0:
-            # mixed_qkv_non_spec = mixed_qkv_non_spec
             mixed_qkv_non_spec = causal_conv1d_update(
                 mixed_qkv_non_spec,
                 conv_state,
@@ -637,79 +632,10 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                                 initial_state,
                                 slot_mapping)
             initial_state = initial_state.view(initial_state_shape)
-            '''
-            # import time
-            if non_spec_state_indices_tensor.shape[0] > 100:
-                initial_state = ssm_state[
-                    non_spec_state_indices_tensor].contiguous()
-            else:
-                initial_state_shape = non_spec_state_indices_tensor.shape + ssm_state.shape[1: ]
-                initial_state = torch.empty(initial_state_shape, dtype=ssm_state.dtype, device=ssm_state.device)
-                for i in range(non_spec_state_indices_tensor.shape[0]):
-                    initial_state[i] = ssm_state[non_spec_state_indices_tensor[i]] #.contiguous()
-            '''
 
             initial_state = initial_state * has_initial_state.view(has_initial_state.shape[0], 1, 1, 1)
-            # initial_state[~has_initial_state, ...] = 0
             initial_state = initial_state.transpose(-1, -2).contiguous()
 
-            # initial_state[~has_initial_state, ...] = 0
-            '''
-            if self.num_v_heads // self.num_k_heads > 1:
-                query_non_spec = query_non_spec.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-                key_non_spec = key_non_spec.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            if non_spec_state_indices_tensor.shape[0] == 1:
-                (
-                    core_attn_out_non_spec,
-                    last_recurrent_state,
-                ) = torch_chunk_gated_delta_rule(
-                    query=query_non_spec,
-                    key=key_non_spec,
-                    value=value_non_spec,
-                    g=g_non_spec,
-                    beta=beta_non_spec,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                )
-                # core_attn_out_non_spec, last_recurrent_state = value_non_spec, initial_state
-                # Init cache
-                # ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                #     ssm_state.dtype)
-                last_recurrent_state = last_recurrent_state.transpose(-1, -2).contiguous()
-                ssm_state[non_spec_state_indices_tensor.squeeze(0)] = last_recurrent_state.to(
-                    ssm_state.dtype)
-            else:
-                core_attn_out_non_spec = torch.empty_like(query_non_spec)
-                for i in range(non_spec_query_start_loc.shape[0] - 1):
-                    bos = non_spec_query_start_loc[i]
-                    eos = non_spec_query_start_loc[i + 1]
-                    query_non_spec_i = query_non_spec[:, bos:eos, :, :]
-                    key_non_spec_i = key_non_spec[:, bos:eos, :, :]
-                    value_non_spec_i = value_non_spec[:, bos:eos, :, :]
-                    g_non_spec_i = g_non_spec[:, bos:eos, :]
-                    beta_non_spec_i = beta_non_spec[:, bos:eos, :]
-                    initial_state_i = initial_state[i]
-                    (
-                        core_attn_out_non_spec_i,
-                        last_recurrent_state_i,
-                    ) = torch_chunk_gated_delta_rule(
-                        query=query_non_spec_i,
-                        key=key_non_spec_i,
-                        value=value_non_spec_i,
-                        g=g_non_spec_i,
-                        beta=beta_non_spec_i,
-                        initial_state=initial_state_i,
-                        output_final_state=True,
-                        use_qk_l2norm_in_kernel=True,
-                    )
-                    # Init cache
-                    core_attn_out_non_spec[:, bos:eos, :, :] = core_attn_out_non_spec_i
-                    last_recurrent_state_i = last_recurrent_state_i.transpose(-1, -2).contiguous()
-                    ssm_state[non_spec_state_indices_tensor[i]] = last_recurrent_state_i.to(
-                        ssm_state.dtype)
-            '''
-            # core_attn_out_non_spec, last_recurrent_state = value_non_spec, initial_state
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -871,24 +797,6 @@ class Qwen3NextAttention(nn.Module):
     ):
         qkv, _ = self.qkv_proj(hidden_states)
 
-        # if self.attn_output_gate:
-        #     q_gate, k, v = qkv.split(
-        #         [self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
-        #     orig_shape = q_gate.shape[:-1]
-        #     q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
-        #     q, gate = torch.chunk(q_gate, 2, dim=-1)
-        #     q = q.reshape(*orig_shape, -1)
-        #     gate = gate.reshape(*orig_shape, -1)
-        # else:
-        #     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-        #                         dim=-1)
-
-        # q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-        #     -1, self.num_heads * self.head_dim)
-        # k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-        #     -1, self.num_kv_heads * self.head_dim)
-
-        # q, k = self.rotary_emb(positions, q, k)
         q, k, v, gate = torch.ops.xspeedgate_ops.split_norm_rope_neox(
             qkv=qkv,
             q_weights=self.q_norm.weight,
