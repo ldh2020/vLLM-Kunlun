@@ -1018,6 +1018,37 @@ def torch_causal_conv1d_update(
     out = out.to(hidden_states.dtype).squeeze(-1)
     return out
 
+def torch_causal_conv1d_update_spec(
+    hidden_states,
+    conv_state,
+    weight,
+    bias=None,
+    activation=None,
+    conv_state_indices=None,
+    num_accepted_tokens=None
+):
+    out = torch.empty_like(hidden_states)
+    _, seq_len, hidden_size = hidden_states.shape
+    for i in range(hidden_states.shape[0]):
+        tmp_conv_state = conv_state[conv_state_indices[i]]
+        state_len = tmp_conv_state.shape[-2]
+        hidden_states_i = hidden_states[i]
+        hidden_states_new = torch.cat([tmp_conv_state[:(2 + num_accepted_tokens[i]), :], hidden_states_i], dim=0).to(weight.dtype)
+
+        hidden_states_new = hidden_states_new.unsqueeze(0)
+
+        conv_state[conv_state_indices[i]] = hidden_states_new[:, -state_len:, :]
+        for j in range(seq_len):
+            if j == seq_len - 1:
+                hidden_states_new_j = hidden_states_new
+            else:
+                hidden_states_new_j = hidden_states_new[:, :(1 - seq_len + j)]
+            hidden_states_new_j = hidden_states_new_j.transpose(-1, -2).contiguous()
+            out_i = F.conv1d(hidden_states_new_j, weight.unsqueeze(1), bias, padding=0, groups=hidden_size)
+            out_i = F.silu(out_i[:, :, -1:])
+            out_i = out_i.to(hidden_states.dtype).squeeze(-1).unsqueeze(0)
+            out[i, j] = out_i
+    return out.view(-1, hidden_size)
 
 @triton.jit()
 def _causal_conv1d_update_kernel_xpu(
@@ -1481,6 +1512,8 @@ def causal_conv1d_update(
     conv_state_indices: Optional[torch.Tensor] = None,
     conv_state_indices_cpu: Optional[torch.Tensor] = None,
     num_accepted_tokens: Optional[torch.Tensor] = None,
+    query_start_loc: torch.Tensor | None = None,
+    max_query_len: int = -1,
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
@@ -1543,8 +1576,11 @@ def causal_conv1d_update(
         assert weight.stride(1) == 1  # Need this
         assert cache_seqlens is None  # not needed for vLLM - circular buffer
 
-    if True or batch > 1:
+    if num_accepted_tokens is None:
         x = x.squeeze(-1).unsqueeze(1)
+    else:
+        x = x.squeeze(-1).view(-1, max_query_len, dim)
+    if num_accepted_tokens is None:
         out = torch.empty_like(x)
         import kunlun_ops
         stride = conv_state.stride()[0]
@@ -1561,84 +1597,16 @@ def causal_conv1d_update(
                     state_seq_stride=stride,
                     is_ncw=False
         )
-        # out = F.silu(out)
         out = out.squeeze(1)
         return out
-        return torch_causal_conv1d_update(
+    else:
+        return torch_causal_conv1d_update_spec(
                 x,
                 conv_state,
                 weight,
                 bias,
                 activation,
-                conv_state_indices=conv_state_indices
+                conv_state_indices=conv_state_indices,
+                num_accepted_tokens=num_accepted_tokens
             )
 
-    # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
-    out = x
-    stride_w_dim, stride_w_width = weight.stride()
-
-    stride_x_seq, stride_x_dim, stride_x_token = x.stride(
-    )  # X (batch, dim, seqlen)
-
-    stride_o_seq, stride_o_dim, stride_o_token = out.stride()
-    stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride(
-    )
-    stride_state_indices = conv_state_indices.stride(
-        0) if conv_state_indices is not None else 0
-    if num_accepted_tokens is not None:
-        state_len = width - 1 + (seqlen - 1)  # effective state_len needed
-    else:
-        state_len = width - 1
-    np2_statelen = triton.next_power_of_2(state_len)
-
-    def grid(META):
-        return (
-            1,
-            triton.cdiv(dim, META["BLOCK_N"]),
-        )
-    for batch_id in range(batch):
-        _causal_conv1d_update_kernel_xpu[grid](
-            x,
-            weight,
-            bias,
-            conv_state,
-            cache_seqlens,
-            conv_state_indices,
-            num_accepted_tokens,
-            out,
-            batch_id=batch_id,
-            batch=batch,
-            dim=dim,
-            seqlen=seqlen,
-            state_len=state_len,
-            num_cache_lines=num_cache_lines,
-            stride_x_seq=stride_x_seq,
-            stride_x_dim=stride_x_dim,
-            stride_x_token=stride_x_token,
-            stride_w_dim=stride_w_dim,
-            stride_w_width=stride_w_width,
-            stride_conv_state_seq=stride_istate_seq,
-            stride_conv_state_dim=stride_istate_dim,
-            stride_conv_state_tok=stride_istate_token,
-            stride_state_indices=stride_state_indices,
-            stride_o_seq=stride_o_seq,
-            stride_o_dim=stride_o_dim,
-            stride_o_token=stride_o_token,
-            pad_slot_id=pad_slot_id,
-            HAS_BIAS=bias is not None,
-            KERNEL_WIDTH=width,
-            SILU_ACTIVATION=activation in ["silu", "swish"],
-            IS_CONTINUOUS_BATCHING=conv_state_indices is not None,
-            IS_SPEC_DECODING=num_accepted_tokens is not None,
-            NP2_STATELEN=np2_statelen,
-            USE_PAD_SLOT=pad_slot_id is not None,
-            BLOCK_N=256,
-            groups_per_cluster=np2_statelen,
-            isCloseUnrollControl=True,
-            isCloseVectorization=True,
-            isCloseOffsetAnalysis=True,
-            is_use_mask_zero = True
-        )
-    if unsqueeze:
-        out = out.squeeze(-1)
-    return out

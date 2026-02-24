@@ -209,6 +209,9 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
     num_prefills: int = 0
     num_decodes: int = 0
 
+    is_speculative: Optional[bool] = False
+    max_model_len: int = 0
+
     def __post_init__(self):
         """__post_init__"""
         self.attn_bias: Optional[List[AttentionBias]] = None
@@ -314,7 +317,8 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             cross_slot_mapping=self.cross_slot_mapping,
             cross_block_tables=self.cross_block_tables,
             enable_kv_scales_calculation=False,
-            use_cascade=self.use_cascade)
+            use_cascade=self.use_cascade,
+            is_speculative=self.is_speculative)
         return self._cached_prefill_metadata
 
     @property
@@ -378,7 +382,8 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             cross_slot_mapping=self.cross_slot_mapping,
             cross_block_tables=self.cross_block_tables,
             enable_kv_scales_calculation=False,
-            use_cascade=self.use_cascade)
+            use_cascade=self.use_cascade,
+            is_speculative=self.is_speculative)
         return self._cached_decode_metadata
 
 
@@ -387,7 +392,7 @@ class KunlunAttentionMetadataBuilder:
     """KunlunAttentionMetadataBuilder"""
     cudagraph_support: ClassVar[AttentionCGSupport] = \
         AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-    reorder_batch_threshold: ClassVar[Optional[int]] = 1
+    reorder_batch_threshold: int | None = None
 
     def __init__(self, kv_cache_spec: AttentionSpec, layer_names: list[str],
                  vllm_config: VllmConfig, device: torch.device):
@@ -406,6 +411,57 @@ class KunlunAttentionMetadataBuilder:
         self.block_size = kv_cache_spec.block_size
         self.kv_cache_spec = kv_cache_spec
         self.device = device
+
+        self._init_reorder_batch_threshold(1, self.vllm_config.speculative_config is not None)
+
+    def _init_reorder_batch_threshold(
+        self,
+        reorder_batch_threshold: int | None = 1,
+        supports_spec_as_decode: bool = False,
+        supports_dcp_with_varlen: bool = False,
+    ) -> None:
+        self.reorder_batch_threshold = reorder_batch_threshold
+        if self.reorder_batch_threshold is not None and supports_spec_as_decode:
+            # If the backend supports spec-as-decode kernels, then we can set
+            # the reorder_batch_threshold based on the number of speculative
+            # tokens from the config.
+            speculative_config = self.vllm_config.speculative_config
+            if (
+                speculative_config is not None
+                and speculative_config.num_speculative_tokens is not None
+            ):
+                self.reorder_batch_threshold = max(
+                    self.reorder_batch_threshold,
+                    1 + speculative_config.num_speculative_tokens,
+                )
+
+        if (
+            self.vllm_config.parallel_config.decode_context_parallel_size > 1
+            and not supports_dcp_with_varlen
+        ):
+            self.reorder_batch_threshold = 1
+
+    def build_for_drafting(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ):
+        """
+        Build attention metadata for draft model. Uses build by default.
+
+        Args:
+            common_attn_metadata: The common attention metadata.
+            draft_index: The index of the current draft operation.
+                When speculating a chain of tokens, this index refers to the
+                draft attempt for the i-th token.
+                For tree-based attention, this index instead refers to the
+                draft attempt for the i-th level in the tree of tokens.
+        """
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            # fast_build=True,
+        )
 
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
@@ -478,8 +534,18 @@ class KunlunAttentionMetadataBuilder:
         kv_lod_cpu = None
         kv_lod_xpu = None
 
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens =\
-            split_decodes_and_prefills(common_attn_metadata)
+        is_spec = self.reorder_batch_threshold > 1
+        if not is_spec:
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens =\
+                split_decodes_and_prefills(common_attn_metadata)
+        else:
+            (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens) = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold or 1,
+                require_uniform=True,
+            )
+        )
 
         num_scheduled_tokens = common_attn_metadata.query_start_loc[1:] - common_attn_metadata.query_start_loc[:-1]
 
@@ -500,6 +566,7 @@ class KunlunAttentionMetadataBuilder:
         attn_metadata = KunlunMetadata(
             num_actual_tokens=num_actual_tokens,
             num_prefills=num_prefills,
+            num_decodes=num_decodes,
             slot_mapping=slot_mapping,
             multi_modal_placeholder_index_maps=None,
             enable_kv_scales_calculation=True,
@@ -518,7 +585,9 @@ class KunlunAttentionMetadataBuilder:
             block_tables=block_table_tensor,
             use_cuda_graph=False,
             use_cascade=use_cascade,
-        )   
+            is_speculative=is_spec,
+            max_model_len=max_seq_len,
+        )
         return attn_metadata
 
     def build_bak(self, common_prefix_len: int,
@@ -772,17 +841,43 @@ class KunlunAttentionImpl(AttentionImpl[KunlunMetadata]):
             else:
                 tmp_block_tables = decode_meta.block_tables * 2 # only test in Qwen3-Next
 
-            kunlun_ops.paged_attention(
-                x=decode_query,
-                k_cache=key_cache,
-                v_cache=value_cache,
-                block_tables=tmp_block_tables,
-                context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
-                context_lens_xpu=decode_meta.seq_lens_tensor,
-                is_context=False,
-                is_causal=True,
-                out=output[:num_decode_tokens],
-                vo_head_dim=self.head_size
+            if not attn_metadata.is_speculative:            
+                kunlun_ops.paged_attention(
+                    x=decode_query,
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    block_tables=tmp_block_tables,
+                    context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
+                    context_lens_xpu=decode_meta.seq_lens_tensor,
+                    is_context=False,
+                    is_causal=True,
+                    out=output[:num_decode_tokens],
+                    vo_head_dim=self.head_size
+                    )
+            else:
+                batch_size = attn_metadata.num_decodes
+                query_seq_len, head_num, head_dim = decode_query.shape
+                assert query_seq_len % batch_size == 0
+                qlen = query_seq_len // batch_size
+                out = output[:num_decode_tokens]
+                assert out.is_contiguous()
+                kunlun_ops.speculative_attention(
+                    out=out.view(batch_size, qlen, head_num, self.head_size),
+                    q=decode_query.view(batch_size, qlen, head_num, head_dim),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    context_lens_cpu=decode_meta.seq_lens_tensor_cpu,
+                    context_lens_xpu=decode_meta.seq_lens_tensor,
+                    batch_num=batch_size,
+                    qlen=qlen,
+                    max_context_len=attn_metadata.max_model_len,
+                    head_num=self.num_heads,
+                    head_dim=self.head_size,
+                    scale=0.0,
+                    kv_head_num=self.num_kv_heads,
+                    block_size=key_cache.shape[2],
+                    max_num_blocks_per_seq=decode_meta.block_tables.shape[1],
+                    block_tables=tmp_block_tables,
                 )
         # Reshape the output tensor.
         return output.view(-1, self.num_heads * self.head_size)
