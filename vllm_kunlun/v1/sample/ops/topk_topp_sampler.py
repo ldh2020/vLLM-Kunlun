@@ -168,6 +168,7 @@ def apply_top_k_top_p_optimized(
     # Descending top-p with exclusive cumsum: equivalent to "shifted > p"
     # but avoids slice copy/clone.
     top_p_mask = (probs_cumsum - probs_sort) >= p.unsqueeze(1)
+    top_p_mask[:, 0] = False
     topk_vals.masked_fill_(top_p_mask, -float("inf"))
 
     # --- Step 4: scatter back to full vocab; fill non-topk with -inf ---
